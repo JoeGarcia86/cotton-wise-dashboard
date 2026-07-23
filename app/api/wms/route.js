@@ -1,40 +1,103 @@
 /**
  * app/api/wms/route.js  (Next.js App Router API route)
  *
- * Server-side proxy: the browser never talks to the WMS/Atlas backend
- * directly. This route forwards the request and attaches the header
- * the backend actually requires for scoping: x-tenant-id.
+ * Talks to the real Atlas AI agent API (https://atlas.item.com), not a
+ * generic REST backend. Atlas answers natural-language questions about
+ * WMS/TMS data (orders, receipts, tasks, etc.) rather than exposing
+ * per-entity REST endpoints.
  *
- * TODO: set this to your real WMS/Atlas backend base URL.
+ * Auth is handled server-side with a service account (ATLAS_USERNAME /
+ * ATLAS_PASSWORD env vars) so the browser never sees Atlas credentials --
+ * same server-side-credentials pattern used for the TCL dashboard relay.
+ *
+ * Required env vars (set in Vercel/Coolify/etc, never in the repo):
+ *   ATLAS_USERNAME
+ *   ATLAS_PASSWORD
  */
-const WMS_BACKEND_BASE_URL = process.env.WMS_BACKEND_BASE_URL || "https://REPLACE_ME.example.com";
 
-export async function POST(request) {
-  const { path, method = "POST", body, token, facilityId, tenantId, timezone } = await request.json();
+const ATLAS_BASE_URL = "https://atlas.item.com";
 
-  if (!token) {
-    return Response.json({ code: "401", message: "Missing auth token." }, { status: 401 });
+// Simple in-memory token cache. Fine for a single serverless instance;
+// worst case we just re-authenticate slightly more often.
+let cachedToken = null;
+let cachedTenantId = null;
+let tokenExpiresAt = 0;
+
+function decodeJwt(token) {
+  const payload = token.split(".")[1];
+  const decoded = Buffer.from(payload, "base64").toString("utf-8");
+  return JSON.parse(decoded);
+}
+
+async function getAtlasToken() {
+  if (cachedToken && Date.now() < tokenExpiresAt) {
+    return { token: cachedToken, tenantId: cachedTenantId };
   }
-  if (!tenantId) {
-    // This is the exact failure mode that looked like a permissions error
-    // before: omitting x-tenant-id gets silently rejected/scoped wrong
-    // instead of returning a clear "missing tenant" error.
-    return Response.json({ code: "400", message: "Missing tenant id." }, { status: 400 });
+
+  const username = process.env.ATLAS_USERNAME;
+  const password = process.env.ATLAS_PASSWORD;
+  if (!username || !password) {
+    throw new Error("ATLAS_USERNAME / ATLAS_PASSWORD are not configured on the server.");
   }
 
-  const upstreamRes = await fetch(`${WMS_BACKEND_BASE_URL}${path}`, {
-    method,
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-      "x-tenant-id": tenantId,
-      "x-facility-id": facilityId,
-      "x-timezone": timezone || "America/New_York",
-    },
-    body: body ? JSON.stringify(body) : undefined,
+  const res = await fetch(`${ATLAS_BASE_URL}/api/auth/password-grant`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
   });
 
-  const data = await upstreamRes.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Atlas auth failed with status ${res.status}`);
+  }
 
-  return Response.json(data, { status: upstreamRes.status });
+  const data = await res.json();
+  const claims = decodeJwt(data.access_token);
+
+  cachedToken = data.access_token;
+  cachedTenantId = claims?.data?.tenant_id || claims?.tenant_id;
+  // Refresh a couple minutes before actual expiry to avoid edge-of-window failures.
+  tokenExpiresAt = Date.now() + (data.expires_in - 120) * 1000;
+
+  return { token: cachedToken, tenantId: cachedTenantId };
+}
+
+export async function POST(request) {
+  const { question, chatId } = await request.json();
+
+  if (!question) {
+    return Response.json({ error: "Missing 'question'." }, { status: 400 });
+  }
+
+  let auth;
+  try {
+    auth = await getAtlasToken();
+  } catch (err) {
+    return Response.json({ error: err.message }, { status: 502 });
+  }
+
+  const atlasRes = await fetch(`${ATLAS_BASE_URL}/api/chat-completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${auth.token}`,
+      "x-tenant-id": auth.tenantId,
+    },
+    body: JSON.stringify({
+      messages: [{ role: "user", content: question }],
+      agentId: "atlas-agent",
+      chatId, // optional, omit for single-shot questions
+      stream: false,
+    }),
+  });
+
+  if (!atlasRes.ok) {
+    const errText = await atlasRes.text().catch(() => "");
+    return Response.json(
+      { error: `Atlas query failed with status ${atlasRes.status}`, detail: errText },
+      { status: 502 }
+    );
+  }
+
+  const data = await atlasRes.json();
+  return Response.json({ text: data.text, steps: data.steps || [] });
 }
